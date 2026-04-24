@@ -6,8 +6,10 @@ Includes: Persistent UI, Inactivity Shutdown, Voice Provisioning, GPIO out-of-ba
 """
 
 import os
+import json
 import asyncio
 import logging
+import urllib.parse
 from datetime import datetime, timezone
 
 import discord
@@ -17,25 +19,29 @@ import aiohttp
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
-# CONFIGURATION — loaded from .env
+# CONFIGURATION
 # ---------------------------------------------------------------------------
 
 load_dotenv()
 
 BOT_TOKEN    = os.getenv("BOT_TOKEN")
-AMP_URL      = os.getenv("AMP_URL", "http://192.168.X.X:8080")
+AMP_URL      = os.getenv("AMP_URL", "http://192.168.0.232:8080")
 AMP_USER     = os.getenv("AMP_USER")
 AMP_PASSWORD = os.getenv("AMP_PASSWORD")
 
 ALLOWED_ROLE_ID      = int(os.getenv("ALLOWED_ROLE_ID", 0))
 DASHBOARD_CHANNEL_ID = int(os.getenv("DASHBOARD_CHANNEL_ID", 0))
-VOICE_LOBBY_ID       = int(os.getenv("VOICE_LOBBY_ID", 0))  # Set in .env to enable voice provisioning
+VOICE_LOBBY_ID       = int(os.getenv("VOICE_LOBBY_ID", 0))  # VC channel ID to enable voice provisioning
 
-GPIO_PIN     = os.getenv("GPIO_PIN", "0")
-GPIOSET_PATH = os.getenv("GPIOSET_PATH", "/usr/bin/gpioset")
+GPIO_PIN     = os.getenv("GPIO_PIN", "18")
+GPIOSET_PATH = os.getenv("GPIOSET_PATH", "/usr/bin/gpioset") 
 
-WATCH_INTERVAL = int(os.getenv("WATCH_INTERVAL", 120))   # Seconds — kept high to spare the Pi 1B CPU
-IDLE_TIMEOUT   = int(os.getenv("IDLE_TIMEOUT", 1800))    # Seconds of 0 players before PC is shut down
+WATCH_INTERVAL      = int(os.getenv("WATCH_INTERVAL", 120))  # Seconds — kept high for Pi 1B CPU
+IDLE_TIMEOUT        = int(os.getenv("IDLE_TIMEOUT", 1800))   # Seconds of 0 players before PC is shut down
+SHUTDOWN_GRACE_SECS = 30   # Wait for servers to stop cleanly before GPIO power-off
+BUTTON_COOLDOWN     = 5    # Per-user button cooldown in seconds to prevent spam
+
+STATE_FILE = "bot_state.json"  # Persists dashboard message ID across restarts
 
 # Fallback server list — used if AMP instance discovery fails
 FALLBACK_SERVERS = {
@@ -73,6 +79,28 @@ class BotState:
         self.global_idle_since    = None
         self.hardware_lock        = asyncio.Lock()
         self.dashboard_msg_id     = None
+        self.button_cooldowns     = {}      # {user_id: last_press_timestamp}
+
+    def save(self):
+        """Persist bot state (currently just the dashboard message ID) to disk."""
+        try:
+            with open(STATE_FILE, "w") as f:
+                json.dump({"dashboard_msg_id": self.dashboard_msg_id}, f)
+        except Exception as e:
+            log.error(f"Failed to save state: {e}")
+
+    def load(self):
+        """Load persisted state from disk if available."""
+        try:
+            with open(STATE_FILE, "r") as f:
+                data = json.load(f)
+                self.dashboard_msg_id = data.get("dashboard_msg_id")
+                if self.dashboard_msg_id:
+                    log.info(f"Loaded dashboard_msg_id {self.dashboard_msg_id} from state file.")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log.error(f"Failed to load state: {e}")
 
 state = BotState()
 
@@ -82,8 +110,7 @@ def now() -> float:
 # AMP returns 10 or 20 for a running server depending on version
 RUNNING_STATES = {10, 20}
 
-STATE_LABEL_FULL  = {0: "Offline", 5: "Starting", 10: "Online", 20: "Online"}
-STATE_LABEL_SHORT = {0: "Offline", 5: "Starting", 10: "Online", 20: "Online"}
+STATE_LABEL = {0: "Offline", 5: "Starting", 10: "Online", 20: "Online"}
 
 # ---------------------------------------------------------------------------
 # PERSISTENT UI
@@ -128,14 +155,32 @@ class DashboardView(discord.ui.View):
             return False
         return True
 
+    async def check_cooldown(self, interaction: discord.Interaction) -> bool:
+        """Returns True if the user may press a button, False if still on cooldown."""
+        uid = interaction.user.id
+        last = state.button_cooldowns.get(uid, 0)
+        if now() - last < BUTTON_COOLDOWN:
+            remaining = int(BUTTON_COOLDOWN - (now() - last)) + 1
+            await interaction.response.send_message(
+                f"Please wait {remaining}s before pressing another button.", ephemeral=True
+            )
+            return False
+        state.button_cooldowns[uid] = now()
+        return True
+
     @discord.ui.button(label="Start", style=discord.ButtonStyle.success, custom_id="btn_start")
     async def btn_start(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.verify(interaction):
             return
+        if not await self.check_cooldown(interaction):
+            return
         label = state.servers[self.selected_server]["label"]
         await interaction.response.send_message(f"Sending start command to **{label}**...", ephemeral=True)
         amp_cog = self.bot.get_cog("AMPInterface")
-        await amp_cog.execute_action(state.servers[self.selected_server]["instance_id"], "Core/Start")
+        ok, _ = await amp_cog.execute_action(state.servers[self.selected_server]["instance_id"], "Core/Start")
+        if not ok:
+            await interaction.followup.send(f"⚠️ Start command failed for **{label}**. Check AMP connectivity.", ephemeral=True)
+            return
         state.watched.add(self.selected_server)
         state.intentional_stops.discard(self.selected_server)
 
@@ -143,41 +188,87 @@ class DashboardView(discord.ui.View):
     async def btn_stop(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.verify(interaction):
             return
+        if not await self.check_cooldown(interaction):
+            return
         label = state.servers[self.selected_server]["label"]
         await interaction.response.send_message(f"Sending stop command to **{label}**...", ephemeral=True)
         amp_cog = self.bot.get_cog("AMPInterface")
         state.intentional_stops.add(self.selected_server)
-        await amp_cog.execute_action(state.servers[self.selected_server]["instance_id"], "Core/Stop")
+        ok, _ = await amp_cog.execute_action(state.servers[self.selected_server]["instance_id"], "Core/Stop")
+        if not ok:
+            state.intentional_stops.discard(self.selected_server)
+            await interaction.followup.send(f"⚠️ Stop command failed for **{label}**. Check AMP connectivity.", ephemeral=True)
 
     @discord.ui.button(label="Restart", style=discord.ButtonStyle.secondary, custom_id="btn_restart")
     async def btn_restart(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.verify(interaction):
             return
+        if not await self.check_cooldown(interaction):
+            return
         label = state.servers[self.selected_server]["label"]
         await interaction.response.send_message(f"Sending restart command to **{label}**...", ephemeral=True)
         amp_cog = self.bot.get_cog("AMPInterface")
         state.intentional_stops.add(self.selected_server)
-        await amp_cog.execute_action(state.servers[self.selected_server]["instance_id"], "Core/Restart")
+        ok, _ = await amp_cog.execute_action(state.servers[self.selected_server]["instance_id"], "Core/Restart")
+        if not ok:
+            state.intentional_stops.discard(self.selected_server)
+            await interaction.followup.send(f"⚠️ Restart command failed for **{label}**. Check AMP connectivity.", ephemeral=True)
+            return
         state.watched.add(self.selected_server)
 
     @discord.ui.button(label="Smart Start", style=discord.ButtonStyle.primary, custom_id="btn_smartstart")
     async def btn_smartstart(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Powers on the host PC via GPIO then starts the selected server."""
+        """Powers on the host PC via GPIO, waits for AMP to wake up, then starts the selected server."""
         if not await self.verify(interaction):
             return
-        await interaction.response.send_message("Triggering host PC power via GPIO...", ephemeral=True)
+        if not await self.check_cooldown(interaction):
+            return
+            
+        await interaction.response.send_message("Triggering host PC power via GPIO... waiting for AMP to boot.", ephemeral=True)
         hw_cog  = self.bot.get_cog("HardwareOps")
         amp_cog = self.bot.get_cog("AMPInterface")
-        await hw_cog.trigger_pc_power()
-        await asyncio.sleep(30)
         label = state.servers[self.selected_server]["label"]
-        await amp_cog.execute_action(state.servers[self.selected_server]["instance_id"], "Core/Start")
+        
+        # Step 1: Send the power pulse
+        await hw_cog.trigger_pc_power()
+        
+        # Step 2: Dynamic wait for AMP (up to 3 minutes)
+        parsed_url = urllib.parse.urlparse(AMP_URL)
+        host_ip    = parsed_url.hostname
+        host_port  = parsed_url.port or 8080
+        
+        amp_awake  = False
+        start_time = now()
+        while now() - start_time < 180:
+            try:
+                _, writer = await asyncio.wait_for(asyncio.open_connection(host_ip, host_port), timeout=1.0)
+                writer.close()
+                await writer.wait_closed()
+                amp_awake = True
+                break
+            except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+                await asyncio.sleep(5)
+                
+        if not amp_awake:
+            await interaction.followup.send(
+                f"⚠️ Sent the power pulse, but the Host PC ({host_ip}) never woke up. "
+                "Please check the hardware connection.", ephemeral=True
+            )
+            return
+            
+        # Step 3: AMP is awake — give it a moment to fully initialize then start the server
+        await asyncio.sleep(5)
+        ok, _ = await amp_cog.execute_action(state.servers[self.selected_server]["instance_id"], "Core/Start")
+        if not ok:
+            await interaction.followup.send(
+                f"⚠️ Host PC is awake, but the start command failed for **{label}**. "
+                "Check AMP connectivity.", ephemeral=True
+            )
+            return
+            
         state.watched.add(self.selected_server)
         state.intentional_stops.discard(self.selected_server)
-        await interaction.followup.send(
-            f"Host PC powered on. Start command sent to **{label}**.",
-            ephemeral=True
-        )
+        await interaction.followup.send(f"✅ Host PC is awake! Start command sent to **{label}**.", ephemeral=True)
 
 # ---------------------------------------------------------------------------
 # COG: AMP API INTERFACE
@@ -191,7 +282,8 @@ class AMPInterface(commands.Cog):
         self.instance_sessions = {}
 
     async def cog_load(self):
-        self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+        # Increased timeout to 30 seconds for the Pi 1B to handle AMP discovery
+        self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
         loaded = await self.refresh_instances()
         if not loaded:
             log.warning("Instance discovery failed — loading fallback server list.")
@@ -312,8 +404,9 @@ class HardwareOps(commands.Cog):
         async with state.hardware_lock:
             try:
                 log.info("Triggering GPIO power pulse...")
+                # Updated to use libgpiod v2.x syntax with the comma toggle
                 p = await asyncio.create_subprocess_exec(
-                    GPIOSET_PATH, "--chip", "/dev/gpiochip0", "--toggle", "500ms", f"{GPIO_PIN}=1",
+                    GPIOSET_PATH, "--chip", "0", "--toggle", "500ms,0", f"{GPIO_PIN}=1",
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE
                 )
@@ -337,6 +430,28 @@ class AutomationEngine(commands.Cog):
     def cog_unload(self):
         self.monitor_loop.cancel()
 
+    async def recover_dashboard(self):
+        """Attempt to re-attach to the dashboard message after a restart."""
+        if not state.dashboard_msg_id:
+            return
+        channel = self.bot.get_channel(DASHBOARD_CHANNEL_ID)
+        if not channel:
+            log.warning("Dashboard channel not found — cannot recover dashboard message.")
+            return
+        try:
+            msg = await channel.fetch_message(state.dashboard_msg_id)
+            view = DashboardView(self.bot)
+            self.dashboard_message = msg
+            self.dashboard_view    = view
+            state.watched = set(state.servers.keys())
+            log.info(f"Dashboard message recovered (ID: {state.dashboard_msg_id}).")
+        except discord.NotFound:
+            log.info("Previous dashboard message no longer exists — a new one must be spawned.")
+            state.dashboard_msg_id = None
+            state.save()
+        except Exception as e:
+            log.error(f"Dashboard recovery error: {e}")
+
     @app_commands.command(name="spawn_dashboard", description="Spawns the persistent control panel (admin only)")
     @app_commands.default_permissions(administrator=True)
     async def spawn_dashboard(self, interaction: discord.Interaction):
@@ -351,6 +466,7 @@ class AutomationEngine(commands.Cog):
         self.dashboard_message = msg
         self.dashboard_view    = view
         state.dashboard_msg_id = msg.id
+        state.save()
         state.watched = set(state.servers.keys())
 
     @app_commands.command(name="refresh_servers", description="Re-discovers AMP instances (admin only)")
@@ -375,7 +491,7 @@ class AutomationEngine(commands.Cog):
             if not data:
                 lines.append(f"**{srv['label']}** — Error retrieving status")
                 continue
-            label   = STATE_LABEL_SHORT.get(data["state"], "Unknown")
+            label   = STATE_LABEL.get(data["state"], "Unknown")
             players = data["players"].get("RawValue", "?") if isinstance(data["players"], dict) else "?"
             lines.append(f"**{srv['label']}** — {label} ({players} players)")
         await interaction.followup.send("\n".join(lines) if lines else "No servers configured.")
@@ -430,7 +546,7 @@ class AutomationEngine(commands.Cog):
                             )
                     state.intentional_stops.discard(key)
 
-                label   = STATE_LABEL_FULL.get(srv_state, "Unknown")
+                label   = STATE_LABEL.get(srv_state, "Unknown")
                 players = data["players"].get("RawValue", 0) if isinstance(data["players"], dict) else 0
                 status_lines.append(f"**{state.servers[key]['label']}**: {label} | Players: {players}")
 
@@ -459,7 +575,7 @@ class AutomationEngine(commands.Cog):
                                 log.info(f"Stop command sent to {state.servers[k]['label']}.")
 
                         # Step 2: Allow servers time to shut down cleanly before cutting power
-                        await asyncio.sleep(30)
+                        await asyncio.sleep(SHUTDOWN_GRACE_SECS)
 
                         # Step 3: Power off the host PC via GPIO
                         success = await hw_cog.trigger_pc_power()
@@ -467,7 +583,7 @@ class AutomationEngine(commands.Cog):
                             log.info("Host PC power-off signal sent via GPIO.")
                             if channel:
                                 await channel.send(
-                                    "No players detected for 30 minutes. "
+                                    f"No players detected for {int(IDLE_TIMEOUT/60)} minutes. "
                                     "All servers stopped and host PC powered off."
                                 )
                         else:
@@ -507,6 +623,8 @@ class AutomationEngine(commands.Cog):
                 except discord.NotFound:
                     self.dashboard_message = None
                     self.dashboard_view    = None
+                    state.dashboard_msg_id = None
+                    state.save()
                 except Exception as e:
                     log.error(f"Dashboard update error: {e}")
 
@@ -527,15 +645,23 @@ class AutomationEngine(commands.Cog):
             return
 
         log.info(f"Voice provisioning triggered by {member.display_name}")
+        channel    = self.bot.get_channel(DASHBOARD_CHANNEL_ID)
         any_online = any(s in RUNNING_STATES for s in state.last_states.values())
-        if not any_online:
-            channel = self.bot.get_channel(DASHBOARD_CHANNEL_ID)
+
+        if any_online:
             if channel:
                 await channel.send(
-                    f"{member.mention} joined the lobby — waking host PC via GPIO."
+                    f"{member.mention} joined the lobby. Servers are already online — use the dashboard to connect."
                 )
-            hw_cog = self.bot.get_cog("HardwareOps")
-            await hw_cog.trigger_pc_power()
+            return
+
+        if channel:
+            await channel.send(
+                f"{member.mention} joined the lobby — waking host PC via GPIO. "
+                "Once the host is up, use the **Smart Start** button on the dashboard to launch a server."
+            )
+        hw_cog = self.bot.get_cog("HardwareOps")
+        await hw_cog.trigger_pc_power()
 
 # ---------------------------------------------------------------------------
 # BOT
@@ -558,13 +684,18 @@ class AMPChatOpsBot(commands.Bot):
 
     async def on_ready(self):
         log.info(f"ChatOps Engine ready — logged in as {self.user} (ID: {self.user.id})")
+        engine_cog = self.get_cog("AutomationEngine")
+        if engine_cog:
+            await engine_cog.recover_dashboard()
 
 if __name__ == "__main__":
-    missing = [k for k in ("BOT_TOKEN", "AMP_USER", "AMP_PASSWORD") if not os.getenv(k)]
+    # Variables are module-level (assigned from os.getenv above), so check globals directly.
+    missing = [k for k in ("BOT_TOKEN", "AMP_USER", "AMP_PASSWORD") if not globals().get(k)]
     if missing:
-        log.error(f"Missing required environment variables: {', '.join(missing)}. Check your .env file.")
+        log.error(f"Missing required configuration variables: {', '.join(missing)}.")
     elif DASHBOARD_CHANNEL_ID == 0:
-        log.error("DASHBOARD_CHANNEL_ID is not set. Check your .env file.")
+        log.error("DASHBOARD_CHANNEL_ID is not set.")
     else:
+        state.load()
         bot = AMPChatOpsBot()
         bot.run(BOT_TOKEN)
